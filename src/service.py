@@ -43,8 +43,9 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
+        payload = dict(data or {})
         next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
+            actor, entity, action, payload, self._lookup
         )
         merged = dict(entity["data"])
         merged.update(patch)
@@ -57,7 +58,26 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        self._apply_effects(actor, entity, action, payload)
         return updated
+
+    def _apply_effects(self, actor, entity, action, data):
+        for effect in self.rules.transition_effects(actor, entity, action, data, self._lookup):
+            target = self.repository.get_entity(effect["id"])
+            if not target:
+                continue
+            patch = dict(effect.get("patch") or {})
+            merged = dict(target["data"])
+            merged.update(patch)
+            updated = self.repository.update_entity(effect["id"], None, effect["status"], merged)
+            self.audit.record(
+                effect["id"],
+                actor,
+                effect.get("audit_action") or ("auto_" + action),
+                target["status"],
+                updated["status"],
+                {"patch": patch, "trigger": entity["id"]},
+            )
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""

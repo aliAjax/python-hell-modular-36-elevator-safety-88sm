@@ -1,11 +1,51 @@
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>电梯与自动扶梯巡检和事件响应</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:2rem;color:#1f2937}main{max-width:860px;margin:auto}pre{background:#f3f4f6;padding:1rem;border-radius:8px;overflow-x:auto}button{padding:.5rem .8rem;cursor:pointer}</style></head>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:2rem;color:#1f2937}main{max-width:860px;margin:auto}pre{background:#f3f4f6;padding:1rem;border-radius:8px;overflow-x:auto}button{padding:.5rem .8rem;cursor:pointer}select{padding:.4rem}table{border-collapse:collapse;margin:.5rem 0}td,th{border:1px solid #d1d5db;padding:.4rem .8rem;text-align:left}</style></head>
 <body><main><h1>电梯与自动扶梯巡检和事件响应</h1><p>这是最小演示页面，主要操作通过JSON API完成。</p><p><button onclick="checkHealth()">检查服务状态</button></p><pre id="result">等待操作</pre>
+<h2>设备检验状态</h2>
+<p><select id="equipmentSelect"></select>
+<button onclick="loadEquipment()">刷新设备列表</button>
+<button onclick="showEquipment()">查看设备</button></p>
+<table>
+<tr><th>设备状态</th><td id="eqStatus">—</td></tr>
+<tr><th>本次检验号</th><td id="eqInspection">—</td></tr>
+<tr><th>受阻原因</th><td id="eqBlockReason">—</td></tr>
+</table>
 <h2>常用接口</h2><pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
 POST /api/entities/&lt;id&gt;/actions</pre></main>
-<script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<script>
+const REASON_LABELS={
+  inspection_failed:'检验不合格，设备已停用',
+  awaiting_permit:'复检已通过，暂停待恢复许可'
+};
+async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}
+async function loadEquipment(){
+  const r=await fetch('/api/equipment');
+  const data=await r.json();
+  const select=document.getElementById('equipmentSelect');
+  select.innerHTML='';
+  for(const item of data.items||[]){
+    const opt=document.createElement('option');
+    opt.value=item.id;
+    opt.textContent=(item.data.asset_no||item.id)+'（'+item.id+'）';
+    select.appendChild(opt);
+  }
+  if(select.options.length){showEquipment()}
+}
+async function showEquipment(){
+  const id=document.getElementById('equipmentSelect').value;
+  if(!id){return}
+  const r=await fetch('/api/entities/'+encodeURIComponent(id));
+  const item=await r.json();
+  document.getElementById('eqStatus').textContent=item.status||'—';
+  document.getElementById('eqInspection').textContent=(item.data&&item.data.last_inspection_id)||'—';
+  const reason=item.data&&item.data.block_reason;
+  document.getElementById('eqBlockReason').textContent=reason?(REASON_LABELS[reason]||reason):'—';
+  document.getElementById('result').textContent=JSON.stringify(item,null,2);
+}
+loadEquipment();
+</script></body></html>
