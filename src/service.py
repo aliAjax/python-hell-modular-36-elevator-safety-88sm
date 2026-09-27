@@ -43,9 +43,14 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
+        next_status, patch, effects = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
+        # Cascade effects are validated against fresh state first, so an
+        # unsatisfied blocker (e.g. equipment not stopped) aborts the whole
+        # action before the primary entity moves.
+        for effect in effects:
+            self._apply_effect(actor, effect, caused_by=(entity_id, action))
         merged = dict(entity["data"])
         merged.update(patch)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
@@ -55,9 +60,42 @@ class DomainService:
             action,
             entity["status"],
             updated["status"],
-            {"patch": patch},
+            {"patch": patch, "effects": effects},
         )
         return updated
+
+    def _apply_effect(self, actor, effect, caused_by):
+        target_id = effect["entity_id"]
+        target = self.repository.get_entity(target_id)
+        if not target:
+            raise NotFoundError("cascade target entity not found: " + target_id)
+        effect_data = dict(effect.get("data") or {})
+        effect_data["caused_by"] = "%s:%s" % caused_by
+        next_status, patch, nested = self.rules.validate_transition(
+            actor, target, effect["action"], effect_data, self._lookup
+        )
+        if nested:
+            raise ConflictError("nested cascade effects are not supported")
+        merged = dict(target["data"])
+        merged.update(patch)
+        updated = self.repository.update_entity(target_id, target["version"], next_status, merged)
+        self.audit.record(
+            target_id,
+            actor,
+            effect["action"],
+            target["status"],
+            updated["status"],
+            {"patch": patch, "cascade_from": caused_by[0], "cascade_action": caused_by[1]},
+        )
+        return updated
+
+    def permit_readiness(self, permit_id):
+        permit = self.repository.get_entity(permit_id)
+        if not permit:
+            raise NotFoundError("entity not found: " + permit_id)
+        if self.rules.normalize_kind(permit["kind"]) != "permit":
+            raise ValidationError("entity %s is not a permit" % permit_id)
+        return self.rules.permit_readiness(permit, self._lookup)
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""

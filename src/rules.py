@@ -1,6 +1,28 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+from .domain import (
+    ConflictError,
+    InvalidTransition,
+    PermissionDenied,
+    PermitBlocked,
+    ValidationError,
+)
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(value, field):
+    if not value:
+        raise ValidationError(field + " is required")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError(field + " must be ISO-8601")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _require(data, fields):
@@ -101,29 +123,185 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _equipment_inspections(equipment_id, lookup):
+    return [
+        i
+        for i in _all(lookup, "inspection")
+        if i["data"].get("equipment_id") == equipment_id
+    ]
+
+
+def _equipment_remediations(equipment_id, lookup):
+    alarm_ids = {
+        a["id"]
+        for a in _all(lookup, "alarm")
+        if a["data"].get("equipment_id") == equipment_id
+    }
+    return [
+        r
+        for r in _all(lookup, "remediation")
+        if r["status"] != "closed"
+        and (r["data"].get("equipment_id") == equipment_id or r["data"].get("alarm_id") in alarm_ids)
+    ]
+
+
+def _equipment_open_rescue_jobs(equipment_id, lookup):
+    alarm_ids = {
+        a["id"]
+        for a in _all(lookup, "alarm")
+        if a["data"].get("equipment_id") == equipment_id
+    }
+    return [
+        job
+        for job in _all(lookup, "rescue_job")
+        if job["data"].get("alarm_id") in alarm_ids and job["status"] not in ("completed", "aborted")
+    ]
+
+
+def _permit_blockers(permit, lookup, now=None):
+    """Return every reason a permit cannot currently be granted."""
+    blockers = []
+    equipment = _find_one(lookup, "equipment", "id", permit["data"].get("equipment_id"))
+    if not equipment:
+        return [{"code": "equipment_missing", "message": "permit requires equipment"}], None, None
+    if equipment["status"] not in ("in_service", "suspended"):
+        blockers.append({
+            "code": "equipment_out_of_service",
+            "message": "equipment is %s and must return to suspended before permit grant" % equipment["status"],
+            "equipment_id": equipment["id"],
+            "equipment_status": equipment["status"],
+        })
+    passed = [i for i in _equipment_inspections(equipment["id"], lookup) if i["status"] == "passed"]
+    latest = max(passed, key=lambda i: i["data"].get("passed_at") or i["data"].get("scheduled_at") or "") if passed else None
+    if not latest:
+        blockers.append({
+            "code": "no_passed_inspection",
+            "message": "permit requires a passed inspection",
+            "equipment_id": equipment["id"],
+        })
+    else:
+        passed_at = _parse_ts(
+            latest["data"].get("passed_at") or latest["data"].get("scheduled_at"),
+            "inspection passed_at",
+        )
+        interval_days = _positive(equipment["data"].get("inspection_interval_days"), "inspection_interval_days")
+        if passed_at + timedelta(days=interval_days) < (now or _utcnow()):
+            blockers.append({
+                "code": "inspection_overdue",
+                "message": "inspection %s passed_at %s exceeds the %s-day inspection interval"
+                % (latest["id"], latest["data"].get("passed_at"), interval_days),
+                "inspection_id": latest["id"],
+                "passed_at": latest["data"].get("passed_at"),
+                "interval_days": interval_days,
+            })
+    open_remediations = _equipment_remediations(equipment["id"], lookup)
+    if open_remediations:
+        blockers.append({
+            "code": "open_remediation",
+            "message": "open remediation blocks the permit: %s"
+            % ", ".join(r["id"] for r in open_remediations),
+            "remediation_ids": [r["id"] for r in open_remediations],
+        })
+    open_jobs = _equipment_open_rescue_jobs(equipment["id"], lookup)
+    if open_jobs:
+        blockers.append({
+            "code": "open_rescue_job",
+            "message": "unfinished rescue job blocks the permit: %s"
+            % ", ".join(j["id"] for j in open_jobs),
+            "rescue_job_ids": [j["id"] for j in open_jobs],
+        })
+    return blockers, latest, equipment
+
+
 def _grant_permit(actor, entity, data, lookup):
+    blockers, latest, equipment = _permit_blockers(entity, lookup)
+    if blockers:
+        raise PermitBlocked(blockers)
+    patch = {
+        "granted_by": actor.user_id,
+        "granted_at": _utcnow().isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "inspection_id": latest["id"],
+    }
+    # A suspended equipment only returns to service through a granted
+    # return-to-service permit; other permit purposes leave status untouched.
+    effects = []
+    if equipment["status"] == "suspended" and entity["data"].get("purpose") == "return_to_service":
+        effects.append({
+            "entity_id": equipment["id"],
+            "action": "return_to_service",
+            "data": {"permit_id": entity["id"], "inspection_id": latest["id"]},
+        })
+    return patch, effects
+
+
+def _pass_inspection(actor, entity, data, lookup):
+    inspection_id = entity["id"]
+    passed_at = data.get("passed_at") or _utcnow().isoformat(timespec="seconds").replace("+00:00", "Z")
+    _parse_ts(passed_at, "passed_at")
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
-    if not equipment or equipment["status"] not in ("in_service", "suspended"):
-        raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
-        raise ConflictError("permit blocked by open remediation")
-    return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+    effects = []
+    if equipment and equipment["status"] == "out_of_service":
+        # A failed equipment only comes back to suspended, pending a new permit.
+        effects.append({
+            "entity_id": equipment["id"],
+            "action": "suspend",
+            "data": {"reason": "reinspection_passed", "inspection_id": inspection_id},
+        })
+    patch = {"passed_at": passed_at, "inspected_by": actor.user_id}
+    return patch, effects
+
+
+def _fail_inspection(actor, entity, data, lookup):
+    inspection_id = entity["id"]
+    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    effects = []
+    if equipment:
+        if equipment["status"] != "out_of_service":
+            effects.append({
+                "entity_id": equipment["id"],
+                "action": "out_of_service",
+                "data": {"reason": "inspection_failed", "inspection_id": inspection_id},
+            })
+        for permit in _all(lookup, "permit"):
+            if (
+                permit["data"].get("equipment_id") == equipment["id"]
+                and permit["status"] == "pending_review"
+            ):
+                effects.append({
+                    "entity_id": permit["id"],
+                    "action": "revoke",
+                    "data": {"reason": "inspection %s failed" % inspection_id, "inspection_id": inspection_id},
+                })
+    patch = {"failed_at": _utcnow().isoformat(timespec="seconds").replace("+00:00", "Z"), "inspected_by": actor.user_id}
+    return patch, effects
+
+
+def _reschedule_inspection(actor, entity, data, lookup):
+    # A reinspection can only be arranged once the failed equipment is stopped.
+    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    if not equipment:
+        raise ValidationError("inspection requires equipment")
+    if equipment["status"] != "out_of_service":
+        raise InvalidTransition(
+            "equipment %s must be out_of_service before rescheduling, current status %s"
+            % (equipment["id"], equipment["status"])
+        )
+    new_scheduled_at = data.get("rescheduled_at") or data.get("scheduled_at")
+    _parse_ts(new_scheduled_at, "rescheduled_at")
+    return {"rescheduled_at": new_scheduled_at}, []
 
 
 def _verify_remediation(actor, entity, data, lookup):
     if not entity["data"].get("evidence"):
         raise ValidationError("remediation evidence is required before verification")
-    return {"verified_by": actor.user_id}
+    return {"verified_by": actor.user_id}, []
 
 
 def _complete_rescue(actor, entity, data, lookup):
     jobs = [j for j in _all(lookup, "rescue_job") if j["data"].get("alarm_id") == entity["id"]]
     if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
         raise ConflictError("alarm cannot close before rescue jobs are complete")
-    return {"resolved_by": actor.user_id}
+    return {"resolved_by": actor.user_id}, []
 
 
 class RuleEngine:
@@ -139,7 +317,9 @@ class RuleEngine:
     }
     TRANSITIONS = {
         "equipment": {
-            "suspend": (("in_service",), "suspended"),
+            # suspend also models the automatic recovery from a failed
+            # inspection: out_of_service -> suspended (reinspection passed).
+            "suspend": (("in_service", "out_of_service"), "suspended"),
             "out_of_service": (("in_service", "suspended"), "out_of_service"),
             "return_to_service": (("suspended",), "in_service"),
         },
@@ -237,6 +417,9 @@ class RuleEngine:
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
+        ("inspection", "pass"): _pass_inspection,
+        ("inspection", "fail"): _fail_inspection,
+        ("inspection", "reschedule"): _reschedule_inspection,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
     }
@@ -273,8 +456,25 @@ class RuleEngine:
         _ensure_role(actor, allowed)
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
+        effects = []
+        if custom:
+            extra, effects = custom(actor, entity, data, lookup)
+        else:
+            extra = {}
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status, patch, effects
+
+    def permit_readiness(self, permit, lookup=None):
+        """Read-only snapshot of the blockers that stop a permit grant."""
+        blockers, latest, equipment = _permit_blockers(permit, lookup or (lambda k, f, v: []))
+        return {
+            "permit_id": permit["id"],
+            "status": permit["status"],
+            "equipment_id": permit["data"].get("equipment_id"),
+            "equipment_status": equipment["status"] if equipment else None,
+            "current_inspection_id": latest["id"] if latest else None,
+            "ready": not blockers,
+            "blockers": blockers,
+        }

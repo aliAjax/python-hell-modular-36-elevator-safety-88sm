@@ -34,16 +34,24 @@ curl http://127.0.0.1:8336/health
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `GET /api/permits/<id>/readiness`：许可批准前的只读检查，返回本次检验号与全部受阻原因。
 
 身份通过`X-User-Id`和`X-Role`请求头传入，角色和动作权限由规则引擎校验。## 核心流程
 
 创建设备后安排检验、维保和困人报警；报警派发救援任务，完成后才能解决。整改证据通过复核后关闭，恢复运行许可必须基于有效的检验和已关闭整改。
 
+## 检验结果与设备状态联动
+
+- 检验判定不合格时，设备立即转为`out_of_service`，该设备所有`pending_review`许可同时作废（`revoked`，记录作废原因和检验号），旧许可不能再用于批准。
+- 不合格检验重排复检前，规则要求设备处于`out_of_service`；设备未停用会被拒绝。
+- 复检通过后设备只回到`suspended`（暂停待许可），批准`return_to_service`许可后才恢复`in_service`。
+- 许可批准一次性汇总全部受阻项：未关闭整改、未结束救援任务、检验通过时间超过设备`inspection_interval_days`，以及设备不在可许可状态。错误类型为`PermitBlocked`，HTTP 409响应体的`blockers`字段逐项给出`code`和明细；`readiness`接口可在批准前查询。
+
 ## 规则重点
 
 - 同一设备编号不能重复创建；同一设备和故障代码不能同时存在多个未关闭报警。
 - 组件更换维保必须填写`part_serial`。
-- 恢复许可受设备状态、通过检验和未关闭整改共同限制。
+- 恢复许可受设备状态、通过检验（含间隔）、未关闭整改和未结束救援任务共同限制。
 
 ## 测试
 

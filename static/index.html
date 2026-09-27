@@ -1,11 +1,198 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>电梯与自动扶梯巡检和事件响应</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:2rem;color:#1f2937}main{max-width:860px;margin:auto}pre{background:#f3f4f6;padding:1rem;border-radius:8px;overflow-x:auto}button{padding:.5rem .8rem;cursor:pointer}</style></head>
-<body><main><h1>电梯与自动扶梯巡检和事件响应</h1><p>这是最小演示页面，主要操作通过JSON API完成。</p><p><button onclick="checkHealth()">检查服务状态</button></p><pre id="result">等待操作</pre>
-<h2>常用接口</h2><pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre></main>
-<script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电梯与自动扶梯巡检和事件响应</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:2rem;color:#1f2937}
+main{max-width:960px;margin:auto}
+pre{background:#f3f4f6;padding:1rem;border-radius:8px;overflow-x:auto;white-space:pre-wrap}
+button{padding:.45rem .8rem;cursor:pointer;border:0;border-radius:6px;background:#2563eb;color:#fff}
+button.secondary{background:#6b7280}
+button.danger{background:#dc2626}
+input,select{padding:.4rem;border:1px solid #d1d5db;border-radius:6px}
+section{border:1px solid #e5e7eb;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0}
+.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;margin:.5rem 0}
+.badge{display:inline-block;padding:.15rem .6rem;border-radius:999px;font-size:.85rem;color:#fff;background:#6b7280}
+.badge.in_service{background:#16a34a}.badge.suspended{background:#d97706}.badge.out_of_service{background:#dc2626}
+.badge.passed{background:#16a34a}.badge.failed{background:#dc2626}.badge.scheduled{background:#2563eb}
+.badge.granted{background:#16a34a}.badge.pending_review{background:#d97706}.badge.revoked{background:#6b7280}
+.blocked{color:#dc2626;font-weight:600}
+.ok{color:#16a34a;font-weight:600}
+table{border-collapse:collapse;width:100%;margin-top:.5rem}
+td,th{border:1px solid #e5e7eb;padding:.4rem .6rem;text-align:left;font-size:.9rem}
+</style>
+</head>
+<body>
+<main>
+<h1>电梯与自动扶梯巡检和事件响应</h1>
+<div class="row">
+  <label>身份 <input id="userId" value="inspector-1" size="12"></label>
+  <label>角色
+    <select id="role">
+      <option value="inspector" selected>inspector</option>
+      <option value="admin">admin</option>
+      <option value="dispatcher">dispatcher</option>
+      <option value="maintenance">maintenance</option>
+      <option value="viewer">viewer</option>
+    </select>
+  </label>
+  <button class="secondary" onclick="checkHealth()">检查服务状态</button>
+</div>
+
+<section>
+  <h2>设备与本次检验</h2>
+  <div class="row">
+    <label>设备ID <input id="equipmentId" placeholder="equipment id" size="36"></label>
+    <button onclick="loadEquipment()">载入设备</button>
+  </div>
+  <div id="equipmentPanel">尚未载入设备。</div>
+  <table id="inspectionTable" hidden>
+    <thead><tr><th>本次检验号</th><th>状态</th><th>计划时间</th><th>判定时间</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>恢复许可</h2>
+  <div class="row">
+    <label>许可ID <input id="permitId" placeholder="permit id" size="36"></label>
+    <button onclick="loadReadiness()">查询受阻原因</button>
+  </div>
+  <div id="permitPanel">尚未查询许可。</div>
+</section>
+
+<section>
+  <h2>接口返回</h2>
+  <pre id="result">等待操作</pre>
+</section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const show = (payload) => { $("result").textContent = JSON.stringify(payload, null, 2); };
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function headers(extra) {
+  return Object.assign({"Content-Type": "application/json", "X-User-Id": $("userId").value, "X-Role": $("role").value}, extra || {});
+}
+async function api(path, options) {
+  const response = await fetch(path, options || {});
+  const body = await response.json();
+  if (!response.ok) throw body;
+  return body;
+}
+async function checkHealth() {
+  show(await api("/health"));
+}
+async function act(entityId, action, data) {
+  return api("/api/entities/" + encodeURIComponent(entityId) + "/actions", {
+    method: "POST", headers: headers(),
+    body: JSON.stringify({action, data: data || {}}),
+  });
+}
+const STATUS_LABEL = {
+  in_service: "在用", suspended: "暂停待许可", out_of_service: "停用",
+  scheduled: "待检", passed: "合格", failed: "不合格",
+  blocked: "未提交", pending_review: "待审", granted: "已批准", revoked: "已作废",
+};
+const badge = (status) => '<span class="badge ' + status + '">' + esc(STATUS_LABEL[status] || status) + "</span>";
+
+async function loadEquipment() {
+  const id = $("equipmentId").value.trim();
+  if (!id) return;
+  try {
+    const equipment = await api("/api/entities/" + encodeURIComponent(id));
+    const all = await api("/api/inspections");
+    const inspections = all.items
+      .filter((i) => i.data.equipment_id === id)
+      .sort((a, b) => (b.data.scheduled_at || "").localeCompare(a.data.scheduled_at || ""));
+    $("equipmentPanel").innerHTML =
+      "<div><strong>" + esc(equipment.data.asset_no) + "</strong>（" + esc(equipment.data.equipment_type) +
+      "，" + esc(equipment.data.location) + "） 检验间隔 " + esc(equipment.data.inspection_interval_days) + " 天</div>" +
+      '<div style="margin-top:.4rem">设备状态：' + badge(equipment.status) + "</div>";
+    const tbody = $("inspectionTable").querySelector("tbody");
+    tbody.innerHTML = "";
+    if (inspections.length === 0) {
+      $("inspectionTable").hidden = true;
+    } else {
+      $("inspectionTable").hidden = false;
+      inspections.forEach((inspection, index) => {
+        const row = tbody.insertRow();
+        const current = index === 0 ? ' <span class="badge scheduled">本次</span>' : "";
+        const decidedAt = inspection.data.passed_at || inspection.data.failed_at || "";
+        row.insertCell().innerHTML = esc(inspection.id) + current;
+        row.insertCell().innerHTML = badge(inspection.status);
+        row.insertCell().textContent = inspection.data.scheduled_at || "";
+        row.insertCell().textContent = decidedAt;
+        const ops = row.insertCell();
+        ops.innerHTML = inspectionButtons(inspection);
+      });
+    }
+    show({equipment, inspections});
+  } catch (error) {
+    show(error);
+  }
+}
+function inspectionButtons(inspection) {
+  if (inspection.status === "scheduled") {
+    return '<button onclick="judge(\'' + inspection.id + '\',\'pass\')">判合格</button> ' +
+           '<button class="danger" onclick="judge(\'' + inspection.id + '\',\'fail\')">判不合格</button>';
+  }
+  if (inspection.status === "failed") {
+    return '<button onclick="reschedule(\'' + inspection.id + '\')">重排复检</button>';
+  }
+  return "—";
+}
+async function judge(inspectionId, action) {
+  const findings = prompt("检验结论（findings）", action === "pass" ? "复检合格" : "存在严重缺陷");
+  if (findings === null) return;
+  try {
+    const payload = {findings};
+    if (action === "pass") payload.passed_at = new Date().toISOString().slice(0, 19) + "Z";
+    show(await act(inspectionId, action, payload));
+    await loadEquipment();
+  } catch (error) { show(error); }
+}
+async function reschedule(inspectionId) {
+  const rescheduledAt = prompt("复检时间（ISO-8601）", new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 19) + "Z");
+  if (!rescheduledAt) return;
+  try {
+    show(await act(inspectionId, "reschedule", {rescheduled_at: rescheduledAt}));
+    await loadEquipment();
+  } catch (error) { show(error); }
+}
+async function loadReadiness() {
+  const id = $("permitId").value.trim();
+  if (!id) return;
+  try {
+    const info = await api("/api/permits/" + encodeURIComponent(id) + "/readiness");
+    const blockers = info.blockers.length
+      ? '<ul class="blocked">' + info.blockers.map((b) => "<li>" + esc(b.message) + "</li>").join("") + "</ul>"
+      : '<p class="ok">无受阻项，可以批准。</p>';
+    $("permitPanel").innerHTML =
+      "<div>许可号：" + esc(info.permit_id) + " " + badge(info.status) + "</div>" +
+      "<div>设备：" + esc(info.equipment_id) + " " + badge(info.equipment_status || "") + "</div>" +
+      "<div>本次检验号：" + esc(info.current_inspection_id || "（无合格检验）") + "</div>" +
+      "<div>受阻原因：</div>" + blockers +
+      '<div class="row">' +
+        '<button class="secondary" onclick="permitAction(\'request_review\')">提交待审</button> ' +
+        '<button onclick="permitAction(\'grant\')">批准恢复许可</button>' +
+      "</div>";
+    show(info);
+  } catch (error) {
+    show(error);
+  }
+}
+async function permitAction(action) {
+  const id = $("permitId").value.trim();
+  if (!id) return;
+  try {
+    show(await act(id, action, {}));
+    await loadReadiness();
+    if ($("equipmentId").value.trim()) await loadEquipment();
+  } catch (error) {
+    show(error); }
+}
+</script>
+</body>
+</html>

@@ -27,6 +27,17 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class PermitBlocked(ConflictError):
+    """Permit grant rejected by one or more cross-object blockers."""
+
+    def __init__(self, blockers):
+        self.blockers = list(blockers or [])
+        detail = "; ".join(
+            str(item.get("message", item.get("code", "blocked"))) for item in self.blockers
+        ) or "permit is blocked"
+        super().__init__("permit cannot be granted: " + detail)
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"
